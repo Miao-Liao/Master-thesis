@@ -1,0 +1,494 @@
+---
+title: "分析"
+author: "Miao Liao"
+date: "2024-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+
+```{r}
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(patchwork)
+library(pinyin)
+library(sf)
+library(tmap)
+library(tmaptools)
+library(gridExtra)
+library(sp)
+library(spdep)
+library(sf)
+library(spatialreg)
+library(lmtest)
+library(car)
+library(knitr)
+library(lmtest)
+library(mice)
+```
+
+在对于研究中国各省二胎政策影响生育率的差异中，我选取了以下变量进行分析：
+
+家庭收入：居民消费价格指数，人均可支配收入
+教育水平：国家财政性教育经费，教育就业人数占比，每10万人口高等教育在校人数
+经济发展：城镇登记失业率，地方财政支出，地区生产总值
+社会保障：城乡居民社会养老保险参保人数，每万人拥有卫生技术人员，年末参加生育保险人数，人均住宅销售额
+
+
+# 数据整理
+
+```{r}
+# File names and English names
+file_names <- c("城乡居民社会养老保险参保人数占比.xls", "城镇登记失业率.xls", "地方财政支出.xls", 
+                "地区生产总值.xlsx", "国家财政性教育经费.xls", "教育就业人数占比.xls", 
+                "居民消费价格指数.xls", "每10万人口高等教育在校人数.xls", 
+                "每万人拥有卫生技术人员.xls", "年末参加生育保险人数.xls", 
+                "人均可支配收入.xls", "人均住宅销售额.xls", "生育率.xlsx")
+english_names <- c("social_insurance_participation", "urban_unemployment_rate", 
+                   "local_fiscal_expenditure", "GDP", "national_education_funding", 
+                   "education_employment_rate", "CPI", "HE_students_per_100000", 
+                   "health_technicians_per_10000", "maternity_insurance_participation", 
+                   "per_capita_disposable_income", "per_capita_residential_sales", 
+                   "fertility_rate")
+
+data_list <- lapply(file_names, function(file) {
+  # Read data
+  data <- read_excel(file,
+                     range = cell_rows(4:35))
+  # Determine column names for pivot_longer()
+  col_names <- colnames(data)[-1]  # Exclude the first column
+  # Pivot the data to long format
+  data_long <- pivot_longer(data, cols = all_of(col_names), names_to = "year", values_to = "value")
+  # Extract year from year column
+  data_long$year <- gsub("年", "", data_long$year)
+  #Convert value to numeric
+  data_long$value <- as.numeric(data_long$value)
+  # Add file name as a column
+  data_long$file_name <- file
+  # Add English name as a column
+  data_long$english_name <- english_names[file_names == file]
+  # Return the modified data
+  return(data_long)
+})
+
+
+# Removes NULL elements from the list
+data_list <- data_list[!sapply(data_list, is.null)]
+
+
+# Bind all data frames together
+final_data <- bind_rows(data_list)
+# Print the first few rows of the final data frame
+final_data$Region <- NULL
+final_data$file_name <- NULL
+
+
+# Pivot the data from long to wide format
+final_data_wide <- pivot_wider(final_data, names_from = english_name, values_from = value)
+
+kable(head(final_data_wide),caption = "clean data")
+```
+
+
+```{r}
+DBDQ2 <- st_read("省级行政区.shp")
+
+DBDQ2$name_1 <- c("Heilongjiang", "Xinjiang", "Shanxi", "Ningxia", "Tibet", "Shandong", 
+                  "Henan", "Jiangsu", "Anhui", "Hubei", "Zhejiang", "Jiangxi", "Hunan", 
+                  "Yunnan", "Guizhou", "Fujian", "Guangxi", "Guangdong", "Hainan", "Jilin", 
+                  "Liaoning", "Tianjin", "Qinghai", "Gansu", "Shaanxi", "Mongolia", "Chongqin", 
+                  "Hebei", "Shanghai", "Beijing", "Taiwan", "Xianggang", "Aomen", "Sichuan")
+
+
+```
+
+# EDA
+
+
+
+## 1.绘制平均出生率的时间序列柱状图
+
+
+```{r fig.width=7}
+average_fertility_rate <- aggregate(fertility_rate ~ year, data = final_data_wide, FUN = mean)
+average_capita<- aggregate(per_capita_residential_sales ~ year, data = final_data_wide, FUN = mean)
+Fertility_plot <- ggplot(average_capita, aes(x = year, y = per_capita_residential_sales)) +
+  geom_bar(stat = "identity", fill = "skyblue") +  # 绘制柱状图
+  labs(
+    x = "Year", 
+    y = "Average Fertility Rate", 
+    title = "Average Fertility Rate Over Time"
+  ) +
+  theme_minimal()  # 使用最小化的主题样式
+
+Fertility_plot <- ggplot(average_fertility_rate, aes(x = year, y = fertility_rate)) +
+  geom_bar(stat = "identity", fill = "skyblue") +  # 绘制柱状图
+  labs(
+    x = "Year", 
+    y = "Average Fertility Rate", 
+    title = "Average Fertility Rate Over Time"
+  ) +
+  theme_minimal()  # 使用最小化的主题样式
+
+Fertility_plot
+```
+
+从上图可以看出，从2004年到2015年相对稳定，维持在11左右，在2016年到2017年略有上升。然而，从2018年开始，生育率开始急剧下降，2022年降到了7.5‰以下。
+对于这种急速下降的趋势，分析其原因：
+
+1.人口政策的调整可能是影响生育率变化的重要因素
+2.经济因素。随着经济发展水平的提高，人们的生活成本、教育费用等也在不断增加，这可能导致了夫妇们推迟生育或选择不生育的情况增加，从而使得生育率下降
+3.社会结构的变化。随着城市化进程的加速和人们生活方式的改变，家庭结构和生活方式也发生了变化，这可能影响了人们的生育观念和选择
+
+
+```{r fig.height=8,fig.width=8}
+# 计算每个城市的平均生育率
+average_fertility_rate <- final_data_wide%>%
+  group_by(province) %>%
+  summarise(mean_fertility_rate = mean(fertility_rate, na.rm = TRUE)) %>%
+  arrange(mean_fertility_rate)
+
+#柱状图
+ggplot(average_fertility_rate, aes(x = reorder(province, mean_fertility_rate), y = mean_fertility_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Average Fertility Rate by Province",
+       x = "Province",
+       y = "Average Fertility Rate") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+从柱状图中可以看出，中国各省份的平均生育率存在显著差异。西藏、青海、新疆、海南和宁夏的平均生育率较高，均在10以上，而辽宁、吉林、黑龙江和天津等省份的平均生育率较低，均在7左右。总体上，西部和南部省份的生育率普遍较高，而东部和东北部省份的生育率相对较低。
+
+## 2.中国各省的人口出生率的空间分布
+
+```{r}
+# 从 final_data_wide 中提取需要的数据
+data_to_map <- final_data_wide[, c("province", "year", "fertility_rate")]
+
+# 将地图数据（DBDQ2）转换为 sf 对象
+DBDQ2_sf <- st_as_sf(DBDQ2)
+
+
+# 创建一个列表，用于存储四个地图对象
+map_list <- list()
+
+# 循环绘制四个年份的地图并存储到列表中
+for (year in c(2012, 2016, 2022)) {
+  # 选择特定年份的数据
+  data_year <- data_to_map[data_to_map$year == year, ]
+  
+  # 合并数据和地图边界
+  data_map <- left_join(DBDQ2_sf, data_year, by = c("name_1" = "province"))
+  
+  # 绘制地图
+  map <- tm_shape(data_map) +
+    tm_polygons(col = "fertility_rate",
+                style = "quantile",
+                n = 5, 
+                palette = "Blues",
+                title = paste("Fertility Rate in", year),
+                legend.position = c("right", "bottom"),
+                textNA = "Missing Data",
+                border.col = "grey50") +
+    tm_layout(title.position = c("center", "top"))
+  # 存储地图对象到列表中
+  map_list[[length(map_list) + 1]] <- map
+}
+
+# 创建地图对象
+maps_combined <- tmap_arrange(map_list[[1]], map_list[[2]], map_list[[3]], nrow = 3, ncol = 1)
+
+# 显示组合后的地图
+maps_combined
+```
+
+
+根据上图可以观察到2012年，2016年和2022年中国各省的人口出生率的空间分布及变化情况。
+在2012年，新疆、青海和西藏等西北地区的人口出生率相对较高，分别为15.32‰、14.30‰和15.48‰，而吉林、辽宁和黑龙江等东北地区的人口出生率较低，分别为5.73‰、6.15‰和6.60‰。
+
+到了2016年，山东的人口出生率显著上升至17.89‰，超过了西北地区的新疆成为排名第一的省份，而福建的人口出生率也有较大增长，达到了14.50‰。与此同时，北部地区的吉林、黑龙江和辽宁的人口出生率仍然保持较低水平。
+
+到2022年，山东仍然保持着较高的人口出生率，但略有下降，达到了6.71‰，福建则略有上升，达到了7.07‰。而新疆和青海等西北地区的人口出生率下降较为明显，分别为6.53‰和10.60‰。除了人口出生率的变化，南部和北部地区在这段时间内的差异也逐渐凸显。南部地区如山东、福建等省份的人口出生率呈现出上升趋势，逐渐超过了一些北部地区，而北部地区如吉林、黑龙江和辽宁的人口出生率仍然相对较低。
+
+
+
+## 3. 缺失值分析
+
+```{r fig.width=10}
+missing_values <- final_data_wide %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "missing_count")
+
+# Plot a bar chart of the missing values count
+ggplot(missing_values, aes(x = reorder(variable, missing_count), y = missing_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = missing_count), hjust = -0.3, size = 3.5) +
+  coord_flip() +
+  labs(title = "Number of Missing Values for Each Column",
+       x = "Variable",
+       y = "Missing Values Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+我对每一列的缺失值数量进行了统计。从结果可以看出，“社会保险参与率”列有248个缺失值，是缺失值最多的列。其次是“人均住宅销售额”和“教育就业率”，分别有186个和124个缺失值。“健康技术人员每万人”和“高等教育学生每十万人”也各有124个缺失值。其他列，如“城市失业率”和“国家教育资金”，则分别有95个和62个缺失值。总体来看，虽然一些关键指标存在较多缺失值，但“省份”、“年份”和“GDP”等列没有缺失值。针对这些数据缺失情况，采取插补法处理缺失值，以确保后续分析的准确性和可靠性。
+
+```{r}
+set.seed(123)
+
+# 使用mice函数进行插补
+imputed_data <- mice(final_data_wide, method = 'pmm', m = 5,printFlag = F)
+
+final_data_imputed <- complete(imputed_data, action = 1)
+
+kable(head(final_data_imputed),caption = "final data")
+```
+
+
+## 4. 单变量分析
+
+```{r fig.width=10}
+numeric_vars <- final_data_imputed %>% select(where(is.numeric)) %>% names()
+
+#将数据转换为长格式
+data_long <- final_data_imputed %>%
+  pivot_longer(cols = all_of(numeric_vars), names_to = "variable", values_to = "value")
+
+#所有数值变量的直方图
+ggplot(data_long, aes(x = value)) +
+  geom_histogram(fill = "steelblue") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Histograms of All Numeric Variables",
+       x = "Value",
+       y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+从直方图中可以看出以下几点结论：大部分数值变量具有右偏的分布，例如 GDP、国家教育资金、人均可支配收入等，这意味着这些变量中大多数值集中在较小的范围，而有少量的较大值。社会保险参与率和教育就业率的分布则较为均匀，数据没有明显的偏向。此外，一些变量如 CPI 和城市失业率在某些特定值附近有明显的峰值，这可能反映了这些指标在不同省份或年份之间的相对稳定性。生育率的分布大致呈现双峰特征，说明在数据集中有两个主要的集中区域。第一个峰值大约在7左右，第二个峰值大约在13左右。这表明在一些省份或年份中，生育率集中在较低的范围，而在其他一些省份或年份中，生育率则相对较高。这种双峰分布可能反映了不同地区或不同时间段内的生育率存在显著差异。
+
+
+## 5. 双变量分析
+
+```{r fig.width=10}
+numeric_vars_except_fertility <- setdiff(numeric_vars, "fertility_rate")
+
+final_data_imputed %>%
+  pivot_longer(cols = all_of(numeric_vars_except_fertility), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value, y = fertility_rate)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Scatter Plots of Numeric Variables vs Fertility Rate",
+       x = "Value",
+       y = "Fertility Rate") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+从数值变量与生育率的散点图中可以得出大多数变量如本地财政支出、国家教育资金、每万人中高等教育学生人数、人均可支配收入等与生育率之间呈现负相关关系，这表明这些指标较高时，生育率往往较低。而变量如社会保险参与率和教育就业率则呈现正相关关系，说明这些指标较高时，生育率也较高。总体来看，经济的指标对生育率有显著影响，且多数情况下是负向影响。
+
+
+# 人口出生率影响因素分析
+
+## 模型1(不考虑年份和province)
+```{r}
+model0<-lm(fertility_rate~social_insurance_participation + 
+    urban_unemployment_rate + local_fiscal_expenditure + GDP + 
+    national_education_funding + education_employment_rate + 
+    CPI + HE_students_per_100000 + health_technicians_per_10000 + 
+    maternity_insurance_participation + per_capita_disposable_income + 
+    per_capita_residential_sales,data=final_data_imputed)
+
+model0_step<-step(model0)
+summary(model0_step)
+```
+
+
+1. **显著影响因素**：多个变量对生育率有显著影响，包括社会保险参与率、城市失业率、本地财政支出、GDP、国家教育资金、教育就业率、CPI、高等教育学生人数、每万人中的健康技术人员和人均住宅销售。
+2. **正相关因素**：社会保险参与率、国家教育资金、CPI、每万人中的健康技术人员和人均住宅销售与生育率呈显著正相关，即这些因素的增加会导致生育率的上升。
+3. **负相关因素**：城市失业率、本地财政支出、GDP、教育就业率和高等教育学生人数与生育率呈显著负相关，即这些因素的增加会导致生育率的下降。
+
+回归方程为：
+
+$\text{fertility_rate} = 3.32 + 0.0779 \cdot \text{social_insurance_participation} - 0.88 \cdot \text{urban_unemployment_rate} - 0.00099 \cdot \text{local_fiscal_expenditure} - 0.0000447 \cdot \text{GDP} + 0.00501 \cdot \text{national_education_funding} - 0.114 \cdot \text{education_employment_rate} + 0.135 \cdot \text{CPI} - 0.00205 \cdot \text{HE_students_per_100000} + 0.0167 \cdot \text{health_technicians_per_10000} + 0.000157 \cdot \text{per_capita_residential_sales}$
+
+
+总体而言，该模型解释了约59.2%的生育率变异（调整后的R平方为58.5%）。模型的r2不是很高。模型的拟合能力较弱。
+
+## 模型2
+```{r}
+model1<-lm(fertility_rate~province + year + social_insurance_participation + 
+    urban_unemployment_rate + local_fiscal_expenditure + GDP + 
+    national_education_funding + education_employment_rate + 
+    CPI + HE_students_per_100000 + health_technicians_per_10000 + 
+    maternity_insurance_participation + per_capita_disposable_income + 
+    per_capita_residential_sales,data=final_data_imputed)
+
+model1_step<-step(model1)
+summary(model1_step)
+```
+
+1. **省份影响**：不同省份对生育率有显著影响。例如，北京、黑龙江、江苏、吉林、辽宁等省份的生育率显著低于基准省份，而广西、贵州、海南、宁夏、青海、西藏和新疆等省份的生育率显著高于基准省份。
+
+2. **时间影响**：一些年份对生育率有显著影响，尤其是2011年、2013年、2018年、2019年、2020年、2021年和2022年，生育率显著低于基准年份2004年。
+
+3. **社会经济因素影响**：多个社会经济因素对生育率有显著影响：
+   - **社会保险参与率**与生育率正相关，参与率每增加一个单位，生育率增加0.03189个单位。
+   - **GDP**与生育率正相关，GDP每增加一个单位，生育率增加0.00001203个单位。
+   - **城市失业率**与生育率呈正相关，但不显著。
+   - **教育就业率**与生育率显著负相关，教育就业率每增加一个单位，生育率减少0.1498个单位。
+   - **高等教育学生人数**与生育率显著负相关，每增加100,000名学生，生育率减少0.3168个单位。
+   - **每万人中的健康技术人员**与生育率正相关，健康技术人员每增加一个单位，生育率增加0.01285个单位。
+   - **人均住宅销售**与生育率正相关，销售额每增加一个单位，生育率增加0.00005909个单位。
+
+4. **其他因素影响**：CPI对生育率有边际显著影响，随着CPI的增加，生育率略有增加。
+
+中国各省的二胎政策在不同省份和不同年份对生育率的影响存在显著差异，且多个社会经济因素也对生育率产生了显著影响。
+
+
+```{r}
+par(mfrow=c(2,2))
+plot(model1_step)
+```
+
+
+
+1. **残差与拟合值图 (Residuals vs Fitted)**：残差大致均匀分布在零线附近，虽然有少量偏离点，但总体上没有明显的模式，说明模型的线性假设基本成立。
+
+2. **正态 Q-Q 图 (Q-Q Plot)**：残差基本沿着参考线分布，但在尾部存在一些偏离，尤其是右侧。这表明残差大体上服从正态分布，但存在一些异常值或重尾现象。
+
+3. **尺度-位置图 (Scale-Location)**：标准化残差的平方根大致均匀分布，虽然有一些散点在高值区域，但整体趋势线相对平滑，说明残差的方差相对均匀。
+
+4. **残差与杠杆值图 (Residuals vs Leverage)**：大多数观测点的杠杆值较低，Cook's 距离也较小，表明没有明显的高杠杆值点或强影响点。然而，图中标记的少数点可能对模型有较大影响，需要进一步检查。
+
+因此，模型在大部分方面表现良好。
+
+```{r}
+vif(model1_step)
+```
+
+从变量膨胀因子（VIF）结果来看，可以得出：
+1. **省份和年份**：虽然GVIF值较高，但其GVIF^(1/(2*Df))值分别为1.11和1.15，表明考虑到自由度后，多重共线性不严重。
+2. **其他变量**：VIF值大于10通常被视为有严重多重共线性。这里的所有变量VIF值都低于10，尽管一些变量如GDP（VIF = 8.23）、高等教育学生人数（VIF = 8.93）和每万人中的健康技术人员（VIF = 8.51）的VIF值较高，但都在可接受范围内，说明这些变量之间存在一定程度的多重共线性，但不至于影响模型的稳定性。
+
+
+```{r}
+# 计算预测值
+final_data_imputed <- final_data_imputed %>%
+  mutate(predicted_fertility_rate = predict(model1_step, newdata = final_data_imputed))
+
+data_long <- final_data_imputed %>%
+  select(year, province, fertility_rate, predicted_fertility_rate) %>%
+  pivot_longer(cols = c(fertility_rate, predicted_fertility_rate), names_to = "type", values_to = "value")
+
+data_long$index<-rep(c(1:(nrow(data_long)/2)),each=2)
+
+#真实值和预测值的双折线图
+ggplot(data_long, aes(x = index, y = value, color = type)) +
+  geom_line(alpha = 0.7) +
+  labs(title = "Actual vs Predicted Fertility Rates",
+       x = "Year",
+       y = "Fertility Rate",
+       color = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom")
+```
+
+从图中可以看出生育率的预测值和真实值比较接近。
+
+--通过对中国各省的生育率进行回归分析和模型检验，发现不同省份和年份对生育率有显著影响，经济和社会因素如社会保险参与率、GDP、教育就业率、高等教育学生人数、人均住宅销售等与生育率存在显著相关性。残差分析显示模型大体符合线性假设和正态分布，但存在少量异常值。绘制的真实值和预测值的双折线图展示了预测模型的效果，整体趋势较为一致，但仍需注意异常点和可能的重尾现象。
+
+# 结论23
+
+表3和表4结果揭示了多个社会经济因素对生育率的显著影响。模型解释了约89.45%的生育率变异，显示出较高的解释力和预测能力。结果表明，地理和区域因素在生育率的差异中起着重要作用。例如，北京、天津、黑龙江、吉林等省份等地区的生育率显著低于基准省份，而广西、贵州、西藏和新疆等省份的生育率则显著高于基准省份。此外，某些年份，如2011年、2013年、2018年之后的生育率显著下降，可能反映了政策调整和社会经济条件的变化。
+
+在具体因素方面，GDP的增加与生育率呈正相关，虽然影响较小，但仍然显著，这表明经济发展在一定程度上鼓励了生育。而社会保险参与率的提升也显著提高了生育率，说明健全的社会保障体系对促进生育有积极作用。医疗资源的改善（如每万人健康技术人员的增加）和住房条件的提升（如人均住宅销售额增加）也与生育率呈正相关，表明这些条件的改善有助于提高生育率。然而，教育就业率和高等教育学生人数的增加则与生育率显著负相关，可能因为教育扩展和就业机会增加导致了生育推迟或减少。
+
+# 聚类分析
+
+```{r}
+# 选择用于聚类分析的变量
+cluster_vars <- c("social_insurance_participation", "urban_unemployment_rate", 
+                  "GDP", "education_employment_rate", 
+                  "CPI", "HE_students_per_100000", "health_technicians_per_10000", 
+                  "per_capita_residential_sales")
+
+# 数据标准化
+final_data_scaled <- scale(final_data_imputed[cluster_vars])
+
+# 设置随机种子以确保结果的可重复性
+set.seed(123)
+
+# 使用肘部法确定最佳聚类数目
+wss <- sapply(1:10, function(k) {
+  kmeans(final_data_scaled, k, nstart = 10)$tot.withinss
+})
+
+# 绘制肘部图
+plot(1:10, wss, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of clusters K",
+     ylab = "Total within-clusters sum of squares")
+
+# 选择聚类数目，例如选择3个聚类
+k <- 3
+
+# 进行 k-means 聚类
+kmeans_result <- kmeans(final_data_scaled, centers = k, nstart = 25)
+
+# 将聚类结果添加到原始数据框中
+final_data_imputed$cluster <- as.factor(kmeans_result$cluster)
+
+# 查看每个省份所属的聚类组
+print(final_data_imputed[, c("province", "cluster")])
+
+# 计算每个聚类组的中心特征值
+cluster_centers <- aggregate(final_data_imputed[, cluster_vars], 
+                             by = list(Cluster = final_data_imputed$cluster), 
+                             FUN = mean)
+
+# 查看每个聚类组的特征
+print(cluster_centers)
+
+# 可视化聚类结果（例如，使用PCA来简化可视化）
+library(ggplot2)
+pca_result <- prcomp(final_data_scaled, scale. = TRUE)
+final_data_imputed$pca1 <- pca_result$x[,1]
+final_data_imputed$pca2 <- pca_result$x[,2]
+
+ggplot(final_data_imputed, aes(x = pca1, y = pca2, color = cluster, label = province)) +
+  geom_point(size = 5) +
+  geom_text(vjust = 1.5) +
+  labs(title = "PCA of Provinces based on Clustered Variables",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal()
+
+
+
+```
+
+
+
+组 1 包括Fujian, Gansu, Guangxi, Guizhou, Hainan, Hebei, Henan, Hunan, Jiangxi, Ningxia, Qinghai, Shandong, Tibet, Xinjiang, Yunnan。这些省份的GDP水平较低（平均为8,935.43亿元），显示出这些地区的经济发展相对滞后。同时，这些地区的教育和医疗资源也较为匮乏（如每十万人高等教育学生数和每万人卫生技术人员数均低于其他组）。然而，尽管经济发展水平较低，这些地区的社会保险参与率相对较高（39.31），这可能反映出政府在这些地区的社会保障投入较为充足，以补足经济发展的不足。
+
+其次，组 2 包括Beijing, Tianjin, Shanghai, Jiangsu, Guangdong。这些省份的GDP水平非常高（平均为44,443.43亿元），表明这些地区的经济高度发达。同时，这些地区的人均住宅销售额远高于其他组，反映了其高消费水平和房地产业的繁荣。这些省份拥有丰富的教育和医疗资源，但社会保险参与率却相对较低（17.4），这可能与这些地区多样化的就业形式和较高的生活成本有关。
+
+最后，组 3 包括Chongqin, Heilongjiang, Hubei, Jilin, Liaoning, Mongolia, Shaanxi, Shanxi, Sichuan, Zhejiang。这些省份在大多数指标上表现中等，表明这些地区的经济发展、教育和医疗资源均处于中等水平。这类地区的社会经济状况较为均衡，各项发展指标介于高经济发展地区与低经济发展地区之间，反映出较为稳定的发展状态。
